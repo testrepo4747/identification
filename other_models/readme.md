@@ -6,3 +6,4 @@
 
 ### If testing is required using model weights, please follow the steps:
 1. Use test.py to run the models by specifying the test data csv file and model weights path.
+2. For E-SPI, use ESPI.ipynb file 'Load and test the model' part to test the model using model weights.
