@@ -17,7 +17,7 @@ This folder contains code for training and testing CodeBERT to generate commit m
 ## Steps to Test CodeBERT to Evaluate Its Commit Message Generation
 
 1. Prepare a CSV file containing code diffs alongside their corresponding commit messages.
-2. Update the trained CodeBERT model weights in the file like this: `/your_data_folder/saved_codebert_models`.
+2. Update the trained CodeBERT model weights in the file like this: `/your_data_folder/saved_codebert_models/codebert_predictions.csv`.
 3. Run the following command to start the testing process:
 
     ```bash
