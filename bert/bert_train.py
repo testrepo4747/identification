@@ -73,11 +73,12 @@ def main(folder_path):
             valid_df.dropna(inplace=True) 
 
             print("train:{}, valid:{}".format(train_df.shape,valid_df.shape))
-            
-            train_sentences = train_df.clean_message.values
+            # Write the correct column name here which contain commit messages.
+            train_sentences = train_df.commit_message.values 
             train_labels = train_df.manually_label.values
             # Get the lists of sentences and their labels.
-            valid_sentences = valid_df.clean_message.values
+            # write the correct column name here which contain commit messages.
+            valid_sentences = valid_df.commit_message.values 
             valid_labels = valid_df.manually_label.values
             
             
