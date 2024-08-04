@@ -1,9 +1,26 @@
-## This folder contains train & test code for models such as LSTM, RNN, PatchRNN, SPI-CM, and E-SPI.
+# Training and Testing Models: LSTM, RNN, PatchRNN, SPI-CM, and E-SPI
 
-### If training is required, please follow the steps:
-1. Download the vector embedding in this folder for training the models from https://www.kaggle.com/datasets/leadbest/googlenewsvectorsnegative300.
-2. Run the Jupyter notebook for each model to train and test the model (e.g run LSTM.ipynb for training LSTM and save the weights)
+This folder contains the code for training and testing models such as LSTM, RNN, PatchRNN, SPI-CM, and E-SPI.
 
-### If testing is required using model weights, please follow the steps:
-1. Use test.py to run the models by specifying the test data csv file and model weights path.
-2. For E-SPI, use ESPI.ipynb file 'Load and test the model' part to test the model using model weights.
+## Training the Models
+
+1. **Download Vector Embeddings**:
+   - Download the vector embeddings required for training the models from [Kaggle](https://www.kaggle.com/datasets/leadbest/googlenewsvectorsnegative300) and place them in this folder.
+
+2. **Run Jupyter Notebooks**:
+   - Use the provided Jupyter notebooks to train and test the models. For example, run `LSTM.ipynb` to train the LSTM model and save the weights.
+
+## Testing the Models
+
+1. **Using Model Weights with test.py**:
+   - Update `test.py` with the test data CSV file path and model weights path. For example:
+     ```python
+     # Load the entire model back.
+     model = load_model('./model_weights/simple_rnn.h5')
+     ```
+   - Run `test.py` to test the models.
+
+2. **Testing E-SPI**:
+   - Use the `ESPI.ipynb` notebook and follow the 'Load and test the model' section to test the E-SPI model using the saved model weights.
+
+
