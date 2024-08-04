@@ -27,3 +27,6 @@ This folder contains code for training and testing CodeBERT to generate commit m
 #### The output will be a CSV file containing generated and original commit messages in `/result.txt`.
 
 This README.md provides a  concise guide for both training and testing CodeBERT.
+
+
+## For classification on generated Commit Message, follow the steps given in the '/bert/' folder for testing BERT on commit messages.
