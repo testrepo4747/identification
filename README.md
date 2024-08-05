@@ -27,3 +27,6 @@ The `gan-bert` folder contains the code for training and testing GAN-BERT to ide
 
 The `other_models` folder contains the code for training and testing models such as LSTM, RNN, PatchRNN, SPI-CM, and E-SPI. Refer to the `other_models/README.md` file for detailed instructions.
 
+### Topic Analysis 
+
+The `bert` folder contains the BERT_Topic.ipynb file which trains the BERTopic model on commit messages to find top topics from commit messages.
