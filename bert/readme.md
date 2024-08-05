@@ -34,4 +34,4 @@
 ## Steps to use BERTopic to find topics from commit messages.
 
 1. Use the BERT_Topic.ipynb file
-2. The BERT_Topic.ipyn notebook trains the BERTopic model on commit messages to find top topics from commit messages.
+2. The BERT_Topic.ipynb notebook trains the BERTopic model on commit messages to find top topics from commit messages.
