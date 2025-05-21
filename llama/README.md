@@ -6,7 +6,7 @@ This project provides two scripts using the LLaMA model with LoRA to classify so
 
 ---
 
-## 🔧 Prerequisites
+## Prerequisites
 
 Install the required libraries:
 
@@ -21,7 +21,7 @@ You will also need:
 
 ---
 
-## 📁 Input Format
+## Input Format
 
 Prepare a CSV file with:
 - For **commit message model** (`auto_llama.py`):
@@ -33,7 +33,7 @@ Prepare a CSV file with:
 
 ---
 
-## 🚀 Training Commit Message Model
+## Training Commit Message Model
 
 Script: `auto_llama.py`
 
@@ -57,7 +57,7 @@ python3 auto_llama.py \
 
 ---
 
-## 🚀 Training Code Diff Model
+##  Training Code Diff Model
 
 Script: `llama_codebase.py`
 
@@ -81,7 +81,7 @@ Script: `llama_codebase.py`
 
 ---
 
-## 📊 Evaluation
+## Evaluation
 
 Both scripts output:
 - Accuracy, precision, recall, F1 score
@@ -95,7 +95,7 @@ Predicted results may be saved to:
 
 ---
 
-## ⚠️ Notes
+## ⚠ Notes
 
 - LoRA and quantized loading are already configured (`bnb_config` with 4-bit precision).
 - Environment is set up for multi-GPU use by default.
