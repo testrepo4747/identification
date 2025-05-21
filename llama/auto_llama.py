@@ -349,69 +349,9 @@ test_labels = test_predictions.label_ids
 class_report = classification_report(test_labels, test_preds, digits=4)
 conf_matrix = confusion_matrix(test_labels, test_preds)
 
-# Print the performance metrics
-# print(f'Accuracy: {test_results["eval_accuracy"]}')
-# print(f'Precision: {test_results["eval_precision"]}')
-# print(f'Recall: {test_results["eval_recall"]}')
-# print(f'F1-score: {test_results["eval_f1"]}')
+
 print("Classification Report:")
 print(class_report)
 print("Confusion Matrix:")
 print(conf_matrix)
-      
-
-# ----------------------------
-# New code to save predictions
-# ----------------------------
-# Add the predicted labels to the original test DataFrame under a new column 'llama_label'
-# test_df['llama_label'] = test_preds
-
-# # Specify the output file path (you can change the path and file name as needed)
-# output_csv_path = "./20_js_test_results_with_llama_labels.csv"
-
-# # Save the DataFrame with the new column to a CSV file
-# test_df.to_csv(output_csv_path, index=False)
-# print(f"Test results with 'llama_label' have been saved to: {output_csv_path}")
-
-# Save the test results and parameters to a text file
-# results_filename = './autollama_test_results_v5.txt'
-
-# # Get the command used to run the script
-# command_line = ' '.join(['python'] + sys.argv)
-
-# # Open the file and append the results
-# with open(results_filename, 'a') as f:
-#     f.write('*' * 70 + '\n')
-#     f.write(f'# Results for file: {command_line}\n\n')
-#     f.write('Classification Report:\n')
-#     f.write(class_report + '\n')
-#     f.write('Confusion Matrix:\n')
-#     f.write(str(conf_matrix) + '\n\n')
-      
-# #       Iterate through each project and evaluate
-# for project in projects:
-#     project_df = test_df[test_df['project'] == project]
-    
-#     # Skip if no data for the project
-#     if project_df.empty:
-#         continue
-
-#     # Prepare test dataset
-#     test_dataset = Dataset.from_pandas(project_df)
-#     tokenized_test_dataset = test_dataset.map(tokenize_function, batched=True)
-
-#     # Evaluate the model
-#     test_results = trainer.evaluate(eval_dataset=tokenized_test_dataset)
-#     accuracies.append((project, test_results['eval_accuracy']))
-
-# # Display results
-# for project, accuracy in accuracies:
-#     print(f"{project}: {accuracy:.2f}")
-
-# # Calculate the average accuracy
-# average_accuracy = sum([acc[1] for acc in accuracies]) / len(accuracies)
-# print(f"Average Accuracy: {average_accuracy:.2f}")
-      
-      
-      
       
