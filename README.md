@@ -15,7 +15,7 @@ This repository contains code for training and testing various language models t
 
 
 ### LLAMA
-The `qwen` folder contains code for training and testing the LLAMA-3.2 models to identify security issues using commit messages, diffs, and both featuers. The results and insights are in the paper manuscript.
+The `llama` folder contains code for training and testing the LLAMA-3.2 models to identify security issues using commit messages, diffs, and both featuers. The results and insights are in the paper manuscript.
 
 ### QEWEN
 The `qwen` folder contains code for training and testing the QWEN-3 and 2.5 models to identify security issues using commit messages, diffs, and both featuers. The results and insights are in the paper manuscript.
