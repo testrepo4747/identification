@@ -7,9 +7,18 @@ This repository contains code for training and testing various language models t
 - **bert**: Contains code for training and testing the BERT model.
 - **code-bert**: Contains code for training and testing CodeBERT for generating commit messages from code changes.
 - **gan-bert**: Contains code for training and testing GAN-BERT to identify security issues using labeled and unlabeled data.
+- **qwen**: Contains code for training and testing the QWEN-3 and 2.5 model to identify security issues using commit messages, diffs, and both.
+- **llama**: Contains code for training and testing the LLAMA-3.2 (1B and 3B) model to identify security issues using commit messages, diffs, and both.
 - **other_models**: Contains code for training and testing models such as LSTM, RNN, PatchRNN, SPI-CM, and E-SPI.
 
 ## Getting Started
+
+
+### LLAMA
+The `qwen` folder contains code for training and testing the LLAMA-3.2 models to identify security issues using commit messages, diffs, and both featuers. The results and insights are in the paper manuscript.
+
+### QEWEN
+The `qwen` folder contains code for training and testing the QWEN-3 and 2.5 models to identify security issues using commit messages, diffs, and both featuers. The results and insights are in the paper manuscript.
 
 ### BERT
 
