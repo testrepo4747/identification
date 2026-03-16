@@ -1,0 +1,726 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Commit Message Pipeline (v10)
+- Two steps: (1) Diff -> Security-aware Summary (JSON), (2) Summary -> Commit Message
+- Designed for Llama 3.2 1B Instruct local inference.
+
+Key upgrades in v10:
+1) Optional **8-bit quantization** (bitsandbytes) to shrink VRAM.
+2) Optional **Flash Attention 2** (if installed & supported) else force **eager** attention to avoid SDPA OOMs on Turing.
+3) **Intelligent Diff Truncation**: prioritizes security-relevant hunks when budget is tight.
+4) **2048-token diff budget** for Step-1 input (system+schema overhead is handled separately).
+5) **SafeGenerator**: centralized, OOM-aware generation with retries + mixed precision.
+6) **Sliding/Chunked summarization**: splits diffs by files/hunks into ≤ budgeted chunks and merges summaries.
+7) tqdm progress; minimal logs; per-row CUDA cache cleanup.
+
+Columns:
+- input:  'patch' (diff), optional 'clean_message' (not used for generation)
+- output: 'summary' (JSON), 'gen_message' (final commit message)
+"""
+
+import os
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import argparse
+import json
+import re
+import warnings
+from typing import List, Dict, Any, Optional, Tuple
+
+import pandas as pd
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
+from transformers.utils import logging as hf_logging
+
+# Quiet transformers + common warnings
+hf_logging.set_verbosity_error()
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(x, **kwargs):
+        return x
+
+# ---------------- Configuration constants ----------------
+DIFF_COL_CANDIDATES = ["patch"]
+ORIG_MSG_COL_CANDIDATES = ["clean_message"]
+
+# Budgets
+DEFAULT_STEP1_TOTAL_PROMPT_BUDGET = 2048    # tokens for (system + user + schema + diff)
+DEFAULT_STEP1_GEN_TOKENS = 192              # generation for step-1
+DEFAULT_STEP2_GEN_TOKENS = 512              # generation for step-2
+
+# Security keywords (for intelligent truncation scoring)
+SECURITY_KEYWORDS = [
+    "auth", "authorize", "authentication", "credential", "password", "token",
+    "crypto", "encrypt", "decrypt", "cipher", "TLS", "SSL",
+    "xss", "csrf", "sql", "injection", "overflow", "bounds", "format string",
+    "sanitize", "validate", "escaping", "permission", "access control",
+    "privilege", "leak", "race", "timing", "side-channel", "dos", "denial",
+    "path traversal", "directory traversal", "sandbox", "seccomp"
+]
+
+# ---------------- Summary schema ----------------
+DEFAULT_SUMMARY_SCHEMA = {
+    "primary_intent": "",
+    "key_changes": [],
+    "files_touched": [],
+    "named_entities": {
+        "functions": [],
+        "apis": [],
+        "params": [],
+        "constants": []
+    },
+    "evidence": [],
+    "net_security_effect": "null",
+    "security_category": [],
+    "candidate_cwe": [],
+    "tests_changed": {
+        "added": [],
+        "modified": [],
+        "removed": []
+    },
+    "breaking_changes": False,
+    "migration_notes": "",
+    "uncertainties": []
+}
+
+# ---------------- Utility helpers ----------------
+def first_existing_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def extract_json(text: str) -> Optional[str]:
+    if not text:
+        return None
+    fence = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", text, re.IGNORECASE)
+    if fence:
+        return fence.group(1).strip()
+    starts = [m.start() for m in re.finditer(r"\{", text)]
+    ends = [m.start() for m in re.finditer(r"\}", text)]
+    if not starts or not ends:
+        return None
+    start = starts[0]
+    end = ends[-1]
+    if end > start:
+        cand = text[start:end+1]
+        cand = re.sub(r",\s*([}\]])", r"\1", cand)
+        return cand
+    return None
+
+def safe_json_loads(s: Optional[str]) -> Optional[Dict[str, Any]]:
+    if s is None:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        s2 = re.sub(r",\s*([}\]])", r"\1", s)
+        try:
+            return json.loads(s2)
+        except Exception:
+            return None
+
+def stringify_anchor(a: Any) -> Optional[str]:
+    if isinstance(a, str):
+        return a.strip() or None
+    if isinstance(a, dict):
+        if "line_span" in a and isinstance(a["line_span"], str):
+            return a["line_span"].strip() or None
+        if "file" in a and "lines" in a:
+            f = str(a["file"]).strip()
+            ln = str(a["lines"]).strip()
+            if f and ln:
+                return f"{f}:{ln}"
+        return None
+    if isinstance(a, (list, tuple)):
+        try:
+            s = ", ".join(map(str, a)).strip()
+            return s or None
+        except Exception:
+            return None
+    return str(a).strip() or None
+
+def normalize_list_to_strings(x: Any) -> List[str]:
+    if not isinstance(x, list):
+        return []
+    out, seen = [], set()
+    for item in x:
+        if isinstance(item, str):
+            s = item.strip()
+        elif isinstance(item, dict):
+            s = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        elif isinstance(item, (list, tuple)):
+            s = ", ".join(str(y) for y in item)
+        else:
+            s = str(item)
+        s = s.strip()
+        if s and s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+def normalize_evidence_to_strings(evidence_list: Any) -> List[str]:
+    if not isinstance(evidence_list, list):
+        return []
+    out, seen = [], set()
+    for item in evidence_list:
+        s = stringify_anchor(item)
+        if s and s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+def estimate_tokens(text: str, tokenizer) -> int:
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+# ---------------- Prompts ----------------
+STEP1_SYSTEM = (
+    "You are a top-tier software security reviewer. Be precise, non-speculative, and evidence-driven. "
+    "Your job is to extract a faithful, security-aware summary strictly grounded in the provided diff. "
+    "Do not reveal chain-of-thought. If information is insufficient, write \"unknown\" or use empty lists. "
+    "Every claimed behavior or security note must be supported by at least one evidence anchor "
+    "(hunk header or concrete line span). Output JSON only that validates the given schema. No extra text."
+)
+STEP1_USER_TEMPLATE = """Summarize the following unified diff for behavior and security impact. 
+Write as many sentences as necessary; no sentence limit. Keep content precise and anchored to the diff.
+
+Unified Diff:
+```
+{FULL_DIFF}
+```
+
+Output JSON Schema:
+{SCHEMA}
+"""
+
+STEP2_SYSTEM = (
+    "You are a staff-level engineer writing developer-grade, security-aware commit messages from a trusted structured summary. "
+    "Treat the JSON summary as the only source of truth. Do not speculate; do not introduce details absent from the JSON. "
+    "Obey formatting and length limits. Output must include (a) the commit message text and (b) a small trailing JSON metadata block. No other text."
+)
+STEP2_USER_TEMPLATE = """Create a commit message from this summary:
+
+```
+{SUMMARY_JSON}
+```
+
+Formatting Rules (strict):
+- Length: Entire commit message (subject + body) ≤ 1,000 tokens.
+- Subject line: ≤ 72 chars, imperative mood (e.g., “Add”, “Fix”, “Refactor”).
+- Security prefix: If net_security_effect ≠ "null", prefix subject with "security:" or "fix(security):".
+- Body: 2–8 bullets drawn from key_changes and named_entities; cite concrete identifiers (functions/APIs/params/constants).
+- Risk line: Always include one line:
+  Risk: <increases|reduces|null> <categories or -> (CWE: <comma-separated or ->)
+- Refs line: Refs: <comma-separated evidence anchors from summary.evidence>
+- No hedging: ban “seems/likely/probably/might”.
+- No hallucinations: do not add files, APIs, or behaviors not present in the summary.
+- Style: concise, factual, developer-friendly.
+
+Output Format (exactly this order):
+<subject line>
+
+- <bullet 1 with concrete identifiers>
+- <bullet 2 ...>
+[optional more bullets]
+Risk: <effect> <category|-> (CWE: <list|->)
+Refs: <anchor1>, <anchor2>, ...
+
+Then append a JSON metadata block on a new line, exactly:
+```json
+{{
+  "style": "conventional_commits",
+  "tokens_estimate_leq_1000": true,
+  "used_categories": ["..."],
+  "used_cwe": ["..."],
+  "files_touched": ["..."]
+}}
+```"""
+
+def format_chat(tokenizer, system_prompt: str, user_prompt: str) -> str:
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}]
+    if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return f"<<SYS>>\n{system_prompt}\n<</SYS>>\n\n[INST] {user_prompt} [/INST]"
+
+def model_is_sharded(model) -> bool:
+    return hasattr(model, "hf_device_map")
+
+# ---------------- Intelligent truncation ----------------
+def score_hunk(hunk_text: str) -> float:
+    score = 0.0
+    # Prioritize headers (contain function names or file scopes)
+    if hunk_text.strip().startswith("@@"):
+        score += 1.0
+    # Security keywords
+    lowered = hunk_text.lower()
+    for kw in SECURITY_KEYWORDS:
+        if kw in lowered:
+            score += 2.0
+    # Function-like changes (very rough)
+    if re.search(r"^[+\-].*\w+\s*\(.*\)", hunk_text, re.MULTILINE):
+        score += 1.5
+    # Large change blocks = more impact
+    lines = [ln for ln in hunk_text.splitlines() if ln.startswith("+") or ln.startswith("-")]
+    score += min(len(lines) / 50.0, 2.0)
+    return score
+
+def assemble_block_with_budget(header: str, hunks: List[str], tokenizer, budget_tokens: int) -> Optional[str]:
+    """Return a truncated diff block that fits in budget tokens, keeping highest-scored hunks first."""
+    pieces = [header]
+    header_tokens = estimate_tokens("\n".join(pieces), tokenizer)
+    remaining = max(0, budget_tokens - header_tokens)
+    if remaining <= 0:
+        return None
+
+    # Sort hunks by score descending
+    ranked = sorted(hunks, key=score_hunk, reverse=True)
+
+    acc = header
+    for h in ranked:
+        candidate = acc + ("\n" if not acc.endswith("\n") else "") + h
+        if estimate_tokens(candidate, tokenizer) <= budget_tokens:
+            acc = candidate
+        else:
+            # try to keep only first N lines from hunk
+            lines = h.splitlines()
+            kept = []
+            for ln in lines:
+                test = acc + ("\n" if not acc.endswith("\n") else "") + "\n".join(kept + [ln])
+                if estimate_tokens(test, tokenizer) <= budget_tokens:
+                    kept.append(ln)
+                else:
+                    break
+            if kept:
+                acc = acc + ("\n" if not acc.endswith("\n") else "") + "\n".join(kept)
+            break
+    return acc
+
+def split_diff_intelligently(diff_text: str, tokenizer, max_diff_tokens: int) -> List[str]:
+    """Split diff into chunks ≤ max_diff_tokens, truncating blocks intelligently when needed."""
+    if not diff_text or not str(diff_text).strip():
+        return [""]
+    blocks = re.split(r"(?=^diff --git )", diff_text, flags=re.MULTILINE)
+    blocks = [b for b in blocks if b.strip()] or [diff_text]
+
+    chunks = []
+    cur = ""
+    for b in blocks:
+        if estimate_tokens(b, tokenizer) <= max_diff_tokens:
+            # try to place whole block
+            if cur and estimate_tokens(cur + "\n" + b, tokenizer) <= max_diff_tokens:
+                cur = cur + "\n" + b
+            else:
+                if cur:
+                    chunks.append(cur)
+                cur = b
+        else:
+            # need intelligent truncation within this block
+            header, *rest = re.split(r"(?=^@@ )", b, flags=re.MULTILINE)
+            hunks = [h for h in rest if h.strip()]
+            header = header.strip()
+            truncated_block = assemble_block_with_budget(header, hunks, tokenizer, budget_tokens=max_diff_tokens)
+            # flush current buffer
+            if cur:
+                chunks.append(cur); cur = ""
+            chunks.append(truncated_block if truncated_block else header[: max_diff_tokens])
+    if cur:
+        chunks.append(cur)
+
+    # Ensure each chunk ≤ max_diff_tokens (very rare overflow)
+    out = []
+    for ch in chunks:
+        if estimate_tokens(ch, tokenizer) <= max_diff_tokens:
+            out.append(ch)
+        else:
+            # final safeguard: trim lines
+            lines = ch.splitlines()
+            acc = []
+            for ln in lines:
+                cand = "\n".join(acc + [ln])
+                if estimate_tokens(cand, tokenizer) <= max_diff_tokens:
+                    acc.append(ln)
+                else:
+                    break
+            out.append("\n".join(acc))
+    return out
+
+# ---------------- SafeGenerator ----------------
+class SafeGenerator:
+    def __init__(self, model, tokenizer, prefer_attn_impl: str = "auto"):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.prefer_attn_impl = prefer_attn_impl
+
+    def _set_attn_impl(self, impl: str):
+        try:
+            self.model.config.attn_implementation = impl
+        except Exception:
+            pass
+
+    def _autocast_ctx(self):
+        if torch.cuda.is_available():
+            return torch.autocast("cuda", dtype=torch.float16)
+        return torch.no_grad()
+
+    def _generate_once(self, prompt: str, max_new_tokens: int, do_sample: bool, temperature: float, top_p: float) -> str:
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "eos_token_id": getattr(self.tokenizer, "eos_token_id", None),
+            "pad_token_id": getattr(self.tokenizer, "pad_token_id", None) or getattr(self.tokenizer, "eos_token_id", None),
+        }
+        if do_sample:
+            gen_kwargs.update({"temperature": temperature, "top_p": top_p})
+
+        if model_is_sharded(self.model):
+            with self._autocast_ctx():
+                output_ids = self.model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask", None),
+                    **gen_kwargs
+                )
+        else:
+            try:
+                dev = next(self.model.parameters()).device
+            except Exception:
+                dev = torch.device("cpu")
+            input_ids = inputs["input_ids"].to(dev)
+            attention_mask = inputs.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(dev)
+            with self._autocast_ctx():
+                output_ids = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    **gen_kwargs
+                )
+        return self.tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+
+    def generate(self, prompt: str, max_new_tokens: int, do_sample: bool, temperature: float, top_p: float, retries: int = 2) -> str:
+        # choose attention impl
+        if self.prefer_attn_impl == "eager":
+            self._set_attn_impl("eager")
+        elif self.prefer_attn_impl == "sdpa":
+            self._set_attn_impl("sdpa")
+
+        cur_new = max_new_tokens
+        # Try primary attempt
+        try:
+            return self._generate_once(prompt, cur_new, do_sample, temperature, top_p)
+        except torch.cuda.OutOfMemoryError:
+            pass
+
+        # Retry loop with reductions and eager fallback
+        for attempt in range(retries):
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+            cur_new = max(96, cur_new // 2)
+            # force eager on retry
+            self._set_attn_impl("eager")
+            try:
+                return self._generate_once(prompt, cur_new, do_sample, temperature, top_p)
+            except torch.cuda.OutOfMemoryError:
+                continue
+        # final fallback
+        return ""
+
+# ---------------- Model loader ----------------
+def load_model(model_path: str, device: str, dtype_opt: str, load_8bit: str, attn_impl_pref: str):
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+
+    # dtype selection
+    if dtype_opt == "auto":
+        if torch.cuda.is_available():
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            dtype = torch.float32
+    else:
+        dtype = {"float32": torch.float32, "float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_opt]
+
+    use_8bit = False
+    bnb_config = None
+    if load_8bit.lower() in ("auto", "true", "1", "yes"):
+        try:
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            use_8bit = True
+        except Exception:
+            use_8bit = False
+
+    kwargs = {
+        "low_cpu_mem_usage": True,
+    }
+
+    if use_8bit:
+        kwargs["quantization_config"] = bnb_config
+        # In 8-bit, dtype is not required for weights; keep compute in fp16 where possible
+        kwargs["device_map"] = "auto" if device == "auto" else None
+    else:
+        # Non-quantized path
+        if device == "auto":
+            max_memory = {}
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    total = torch.cuda.get_device_properties(i).total_memory
+                    budget = int(total * 0.85)
+                    max_memory[i] = f"{budget // (1024**3)}GiB"
+            max_memory["cpu"] = "64GiB"
+            kwargs.update({"device_map": "auto", "max_memory": max_memory})
+        # dtype
+        kwargs["torch_dtype"] = dtype
+
+        # attention impl preference
+        if attn_impl_pref in ("eager", "sdpa"):
+            kwargs["attn_implementation"] = attn_impl_pref
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
+
+    model.eval()
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+        try:
+            if attn_impl_pref in ("eager", "sdpa"):
+                model.config.attn_implementation = attn_impl_pref
+        except Exception:
+            pass
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    return tokenizer, model
+
+# ---------------- Token budgeting ----------------
+def count_step1_overhead_tokens(tokenizer) -> int:
+    schema_json = json.dumps(DEFAULT_SUMMARY_SCHEMA, indent=2)
+    user_prompt = STEP1_USER_TEMPLATE.format(FULL_DIFF="", SCHEMA=schema_json)
+    prompt = format_chat(tokenizer, STEP1_SYSTEM, user_prompt)
+    return estimate_tokens(prompt, tokenizer)
+
+# ---------------- Steps ----------------
+def coerce_summary_types(js: Dict[str, Any]) -> Dict[str, Any]:
+    out = json.loads(json.dumps(DEFAULT_SUMMARY_SCHEMA))
+    out["primary_intent"] = str(js.get("primary_intent", "") or "")
+    out["key_changes"] = normalize_list_to_strings(js.get("key_changes", []))
+    out["files_touched"] = normalize_list_to_strings(js.get("files_touched", []))
+    ne = js.get("named_entities", {}) or {}
+    out["named_entities"]["functions"] = normalize_list_to_strings(ne.get("functions", []))
+    out["named_entities"]["apis"] = normalize_list_to_strings(ne.get("apis", []))
+    out["named_entities"]["params"] = normalize_list_to_strings(ne.get("params", []))
+    out["named_entities"]["constants"] = normalize_list_to_strings(ne.get("constants", []))
+    out["evidence"] = normalize_evidence_to_strings(js.get("evidence", []))
+    nse = js.get("net_security_effect", "null")
+    out["net_security_effect"] = nse if nse in ("increases","reduces","null") else "null"
+    out["security_category"] = normalize_list_to_strings(js.get("security_category", []))
+    out["candidate_cwe"] = normalize_list_to_strings(js.get("candidate_cwe", []))
+    tc = js.get("tests_changed", {}) or {}
+    out["tests_changed"]["added"] = normalize_list_to_strings(tc.get("added", []))
+    out["tests_changed"]["modified"] = normalize_list_to_strings(tc.get("modified", []))
+    out["tests_changed"]["removed"] = normalize_list_to_strings(tc.get("removed", []))
+    out["breaking_changes"] = bool(js.get("breaking_changes", False))
+    out["migration_notes"] = str(js.get("migration_notes", "") or "")[:1000]
+    out["uncertainties"] = normalize_list_to_strings(js.get("uncertainties", []))
+    return out
+
+def step1_summarize(diff_text: str, tokenizer, model, gen: SafeGenerator, total_prompt_budget: int, gen_tokens: int) -> Dict[str, Any]:
+    if not diff_text or not diff_text.strip():
+        return json.loads(json.dumps(DEFAULT_SUMMARY_SCHEMA))
+
+    overhead = count_step1_overhead_tokens(tokenizer)
+    max_diff_tokens = max(128, total_prompt_budget - overhead - max(64, gen_tokens // 2))
+
+    # Split with intelligent truncation into chunks ≤ max_diff_tokens
+    chunks = split_diff_intelligently(diff_text, tokenizer, max_diff_tokens=max_diff_tokens)
+
+    schema_json = json.dumps(DEFAULT_SUMMARY_SCHEMA, indent=2)
+    partials = []
+    for ch in chunks:
+        user_prompt = STEP1_USER_TEMPLATE.format(FULL_DIFF=ch, SCHEMA=schema_json)
+        prompt = format_chat(tokenizer, STEP1_SYSTEM, user_prompt)
+        raw = gen.generate(prompt, max_new_tokens=gen_tokens, do_sample=False, temperature=0.0, top_p=0.95, retries=2)
+        js_raw = safe_json_loads(extract_json(raw)) or {}
+        partials.append(coerce_summary_types(js_raw))
+
+    if len(partials) == 1:
+        return partials[0]
+
+    # Merge coerced partials
+    out = json.loads(json.dumps(DEFAULT_SUMMARY_SCHEMA))
+    def extend(dst: list, src: list):
+        seen = set(dst)
+        for s in src:
+            s = s if isinstance(s, str) else str(s)
+            if s and s not in seen:
+                dst.append(s); seen.add(s)
+
+    for it in partials:
+        if it.get("primary_intent") and not out["primary_intent"]:
+            out["primary_intent"] = it["primary_intent"]
+        extend(out["key_changes"], it.get("key_changes", []))
+        extend(out["files_touched"], it.get("files_touched", []))
+        for k in ["functions","apis","params","constants"]:
+            extend(out["named_entities"][k], it.get("named_entities", {}).get(k, []))
+        extend(out["evidence"], it.get("evidence", []))
+        extend(out["security_category"], it.get("security_category", []))
+        extend(out["candidate_cwe"], it.get("candidate_cwe", []))
+        for k in ["added","modified","removed"]:
+            extend(out["tests_changed"][k], it.get("tests_changed", {}).get(k, []))
+        out["breaking_changes"] = out["breaking_changes"] or bool(it.get("breaking_changes", False))
+        if it.get("migration_notes"):
+            out["migration_notes"] = (out["migration_notes"] + " | " if out["migration_notes"] else "") + it["migration_notes"]
+        extend(out["uncertainties"], it.get("uncertainties", []))
+
+    votes = [it.get("net_security_effect","null") for it in partials]
+    if votes.count("increases") > votes.count("reduces"):
+        out["net_security_effect"] = "increases"
+    elif votes.count("reduces") > votes.count("increases"):
+        out["net_security_effect"] = "reduces"
+    else:
+        out["net_security_effect"] = "null"
+    out["migration_notes"] = out["migration_notes"][:1000]
+    return out
+
+def step2_commit(summary: Dict[str, Any], tokenizer, model, gen: SafeGenerator, gen_tokens: int) -> str:
+    js = coerce_summary_types(summary)
+    # Light clip to control prompt size
+    def prompt_tokens(obj: Dict[str, Any]) -> int:
+        s = json.dumps(obj, ensure_ascii=False, indent=2)
+        user = STEP2_USER_TEMPLATE.format(SUMMARY_JSON=s)
+        prompt = format_chat(tokenizer, STEP2_SYSTEM, user)
+        return estimate_tokens(prompt, tokenizer)
+
+    limits = [
+        (("key_changes",), 14),
+        (("files_touched",), 30),
+        (("named_entities","functions"), 24),
+        (("named_entities","apis"), 24),
+        (("named_entities","params"), 24),
+        (("named_entities","constants"), 24),
+        (("evidence",), 30),
+        (("security_category",), 12),
+        (("candidate_cwe",), 12),
+        (("tests_changed","added"), 14),
+        (("tests_changed","modified"), 14),
+        (("tests_changed","removed"), 14),
+        (("uncertainties",), 12),
+    ]
+    def get_in(d, path):
+        cur = d
+        for k in path:
+            cur = cur.get(k, [])
+        return cur
+    def set_in(d, path, val):
+        cur = d
+        for k in path[:-1]:
+            if k not in cur or not isinstance(cur[k], dict):
+                cur[k] = {}
+            cur = cur[k]
+        cur[path[-1]] = val
+
+    while prompt_tokens(js) > 1200:
+        changed = False
+        for path, cap in limits:
+            arr = get_in(js, path)
+            if isinstance(arr, list) and len(arr) > cap:
+                set_in(js, path, arr[:cap]); changed = True
+        if not changed:
+            mn = js.get("migration_notes","")
+            if len(mn) > 400:
+                js["migration_notes"] = mn[:400]; changed = True
+        if not changed:
+            break
+
+    user_prompt = STEP2_USER_TEMPLATE.format(SUMMARY_JSON=json.dumps(js, ensure_ascii=False, indent=2))
+    prompt = format_chat(tokenizer, STEP2_SYSTEM, user_prompt)
+    raw = gen.generate(prompt, max_new_tokens=gen_tokens, do_sample=True, temperature=0.35, top_p=0.9, retries=1)
+    if not raw:
+        return "chore: generate commit message (reduced due to memory constraints)"
+
+    m = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", raw, re.IGNORECASE)
+    if m:
+        return raw[:m.start()].strip()
+    js_tail = extract_json(raw)
+    if js_tail:
+        return raw.replace(js_tail, "").strip()
+    return raw.strip()
+
+# ---------------- CLI ----------------
+def main():
+    ap = argparse.ArgumentParser(description="Diff → Summary → Commit Message (Llama-3.2-1B-Instruct)")
+    ap.add_argument("--csv_path", required=True, type=str)
+    ap.add_argument("--model_path", required=True, type=str)
+    ap.add_argument("--output_csv", required=True, type=str)
+    ap.add_argument("--max_rows", default=None, type=int)
+
+    # Memory/perf knobs
+    ap.add_argument("--device", default="auto", type=str, help="auto | cpu | cuda | cuda:N")
+    ap.add_argument("--dtype", default="auto", choices=["auto","float32","float16","bfloat16"], type=str)
+    ap.add_argument("--load_8bit", default="auto", choices=["auto","true","false"], type=str,
+                    help="Try 8-bit quantization with bitsandbytes")
+    ap.add_argument("--attn_impl", default="eager", choices=["auto","eager","sdpa"], type=str,
+                    help="Preferred attention impl")
+
+    # Budgets
+    ap.add_argument("--step1_total_prompt", default=2048, type=int, help="TOTAL tokens (system+schema+diff) for Step-1")
+    ap.add_argument("--step1_gen", default=DEFAULT_STEP1_GEN_TOKENS, type=int, help="Step-1 max_new_tokens")
+    ap.add_argument("--step2_gen", default=DEFAULT_STEP2_GEN_TOKENS, type=int, help="Step-2 max_new_tokens")
+
+    ap.add_argument("--seed", default=42, type=int)
+    args = ap.parse_args()
+
+    set_seed(args.seed)
+
+    df = pd.read_csv(args.csv_path)
+    diff_col = first_existing_col(df, DIFF_COL_CANDIDATES)
+    if not diff_col:
+        raise ValueError(f"CSV must contain column: {DIFF_COL_CANDIDATES}")
+    if "summary" not in df.columns:
+        df["summary"] = ""
+    if "gen_message" not in df.columns:
+        df["gen_message"] = ""
+    if args.max_rows is not None:
+        df = df.head(args.max_rows).copy()
+
+    tokenizer, model = load_model(args.model_path, device=args.device, dtype_opt=args.dtype,
+                                  load_8bit=args.load_8bit, attn_impl_pref=args.attn_impl)
+    gen = SafeGenerator(model, tokenizer, prefer_attn_impl=args.attn_impl)
+
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
+        diff_text = str(row.get(diff_col, "") or "")
+        summary = step1_summarize(
+            diff_text, tokenizer, model, gen,
+            total_prompt_budget=args.step1_total_prompt,
+            gen_tokens=args.step1_gen
+        )
+        df.at[idx, "summary"] = json.dumps(summary, ensure_ascii=False)
+
+        gen_msg = step2_commit(summary, tokenizer, model, gen, gen_tokens=args.step2_gen)
+        ids = tokenizer.encode(gen_msg, add_special_tokens=False)
+        if len(ids) > 1000:
+            gen_msg = tokenizer.decode(ids[:1000], skip_special_tokens=True).strip()
+        df.at[idx, "gen_message"] = gen_msg
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+    os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
+    df.to_csv(args.output_csv, index=False)
+    print(f"Saved results to: {args.output_csv}")
+
+
+if __name__ == "__main__":
+    main()
