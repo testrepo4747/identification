@@ -3,6 +3,7 @@
 This project provides two scripts using the LLaMA model with LoRA to classify software commits as **security-related** or **not**, based on either:
 - Commit messages
 - Code diffs (patches)
+- Messages + patches
 
 ---
 
