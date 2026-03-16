@@ -1,4 +1,4 @@
-# Security Issues Identification using Commit Messages
+# ProVul: A Project-Centric Benchmark for Vulnerability Detection in Open-Source Software (submitted to KDD'26 D&B)
 
 This repository contains code for training and testing various language models to identify security issues in commit messages from open-source software (OSS) repositories. The models included are BERT, CodeBERT, GAN-BERT, and other approaches such as LSTM, RNN, PatchRNN, SPI-CM, and E-SPI.
 
