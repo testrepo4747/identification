@@ -1,10 +1,6 @@
-# Qwen LoRA Sequence Classification
 
-Minimal guide to train and test the refactored Qwen classification pipeline.
 
-## 1. What this project does
-
-This project fine-tunes a Qwen sequence classification model with LoRA / QLoRA for binary classification using:
+This fine-tunes a Qwen sequence classification model with LoRA / QLoRA for binary classification using:
 
 - commit message
 - patch / diff
