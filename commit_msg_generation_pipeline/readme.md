@@ -1,4 +1,4 @@
-# Commit Message Generation from Diffs
+# Security-related Commit Message Generation from Diffs
 
 A concise two-step pipeline for generating commit messages from Git diffs with a local LLM.
 
