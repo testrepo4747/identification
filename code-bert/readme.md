@@ -1,4 +1,4 @@
-# CodeBERT for Generating Commit Messages from Code Changes
+# CodeBERT for Generating Commit Messages from Code Changes (diffs)
 
 This folder contains code for training and testing CodeBERT to generate commit messages from code changes.
 
