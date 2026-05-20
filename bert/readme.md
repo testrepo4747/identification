@@ -1,8 +1,8 @@
 
 
-## Steps to Train BERT
+## Steps to Train BERT e.g commit messages
 
-1. Prepare a CSV file containing the following columns:
+1. Prepare a CSV file containing the following column:
     - `commit_message`: The commit message text.
     - `label`: The label indicating if the commit message is security-related (1) or not (0).
 2. The training process will use a split of 90% for training and 10% for testing.
