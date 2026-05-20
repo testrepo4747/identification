@@ -21,6 +21,6 @@ This folder contains the code for training and testing models such as LSTM, RNN,
    - Run `test.py` to test the models.
 
 2. **Testing E-SPI**:
-   - Use the `ESPI.ipynb` notebook and follow the 'Load and test the model' section to test the E-SPI model using the saved model weights.
+   - Use the `ESPI.ipynb` notebook and follow the 'Load and test the model' section to test the E-SPI model using  saved model weights.
 
 
