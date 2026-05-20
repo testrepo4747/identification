@@ -1,4 +1,4 @@
-# GAN-BERT for Identifying Security Issues in Commit Messages
+# GAN-BERT for Identifying Security-related Commits
 
 This folder contains code for training and testing GAN-BERT to identify security issues in commit messages using labeled and unlabeled data.
 
